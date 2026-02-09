@@ -40,3 +40,14 @@ endif()
 add_test(NAME msquiccoretest
          COMMAND msquiccoretest
          WORKING_DIRECTORY ${QUIC_OUTPUT_DIR})
+
+# RecvBuffer benchmark (standalone CLI, no gtest)
+add_executable(recvbufferbench RecvBufferBench.cpp)
+target_include_directories(recvbufferbench PRIVATE ${PROJECT_SOURCE_DIR}/src/core)
+target_link_libraries(recvbufferbench msquic)
+if (BUILD_SHARED_LIBS)
+    target_link_libraries(recvbufferbench core msquic_platform)
+endif()
+target_link_libraries(recvbufferbench inc warnings logging base_link)
+set_property(TARGET recvbufferbench PROPERTY FOLDER "${QUIC_FOLDER_PREFIX}tests")
+set_property(TARGET recvbufferbench APPEND PROPERTY BUILD_RPATH "$ORIGIN")

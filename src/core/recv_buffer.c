@@ -43,6 +43,13 @@ Abstract:
 #include "recv_buffer.c.clog.h"
 #endif
 
+//
+// Override verified buffer allocation to use msquic's allocator.
+//
+#define VERIFIED_CB_ALLOC(Size) CXPLAT_ALLOC_NONPAGED(Size, QUIC_POOL_RECVBUF)
+#define VERIFIED_CB_FREE(Ptr) CXPLAT_FREE(Ptr, QUIC_POOL_RECVBUF)
+#include "circular_buffer_verified.c"
+
 typedef struct QUIC_RECV_CHUNK_ITERATOR {
     QUIC_RECV_CHUNK* NextChunk;
     CXPLAT_LIST_ENTRY* IteratorEnd;
@@ -309,6 +316,23 @@ QuicRecvBufferInitialize(
         }
         CxPlatListInsertHead(&RecvBuffer->Chunks, &Chunk->Link);
         RecvBuffer->Capacity = AllocBufferLength;
+
+        if (RecvMode == QUIC_RECV_BUF_MODE_CIRCULAR) {
+            //
+            // Initialize the verified circular buffer.
+            // It manages its own allocation; the chunk's buffer is used
+            // by other modes but for CIRCULAR mode the verified buffer
+            // is the source of truth for ReadStart/PrefixLength.
+            //
+            // We point the verified buffer at the chunk's existing allocation
+            // to avoid a double allocation.
+            //
+            RecvBuffer->VerifiedBuf.Buffer = Chunk->Buffer;
+            RecvBuffer->VerifiedBuf.ReadStart = 0;
+            RecvBuffer->VerifiedBuf.AllocLength = AllocBufferLength;
+            RecvBuffer->VerifiedBuf.PrefixLength = 0;
+            RecvBuffer->VerifiedBuf.VirtualLength = VirtualBufferLength;
+        }
     } else {
         RecvBuffer->Capacity = 0;
     }
@@ -518,23 +542,40 @@ QuicRecvBufferResize(
     //
 
     if (LastChunkIsFirst) {
-        uint32_t WrittenSpan =
-            CXPLAT_MIN(LastChunk->AllocLength, QuicRecvBufferGetSpan(RecvBuffer));
-        uint32_t LengthBeforeWrap = LastChunk->AllocLength - RecvBuffer->ReadStart;
-        if (WrittenSpan <= LengthBeforeWrap) {
-            CxPlatCopyMemory(
+        if (RecvBuffer->RecvMode == QUIC_RECV_BUF_MODE_CIRCULAR) {
+            //
+            // CIRCULAR mode: verified linearization + state update.
+            // VerifiedCircBufLinearizeTo IS the verified resize algorithm.
+            // (Verified: lemma_loop_is_linearized, lemma_resize_invariant_step,
+            //  linearize_preserves_coherence, resize_prefix_length)
+            //
+            VerifiedCircBufLinearizeTo(
+                &RecvBuffer->VerifiedBuf,
                 NewChunk->Buffer,
-                LastChunk->Buffer + RecvBuffer->ReadStart,
-                WrittenSpan);
+                NewChunk->AllocLength);
+            VerifiedCircBufSyncAfterResize(
+                &RecvBuffer->VerifiedBuf,
+                NewChunk->Buffer,
+                NewChunk->AllocLength);
         } else {
-            CxPlatCopyMemory(
-                NewChunk->Buffer,
-                LastChunk->Buffer + RecvBuffer->ReadStart,
-                LengthBeforeWrap);
-            CxPlatCopyMemory(
-                NewChunk->Buffer + LengthBeforeWrap,
-                LastChunk->Buffer,
-                WrittenSpan - LengthBeforeWrap);
+            uint32_t WrittenSpan =
+                CXPLAT_MIN(LastChunk->AllocLength, QuicRecvBufferGetSpan(RecvBuffer));
+            uint32_t LengthBeforeWrap = LastChunk->AllocLength - RecvBuffer->ReadStart;
+            if (WrittenSpan <= LengthBeforeWrap) {
+                CxPlatCopyMemory(
+                    NewChunk->Buffer,
+                    LastChunk->Buffer + RecvBuffer->ReadStart,
+                    WrittenSpan);
+            } else {
+                CxPlatCopyMemory(
+                    NewChunk->Buffer,
+                    LastChunk->Buffer + RecvBuffer->ReadStart,
+                    LengthBeforeWrap);
+                CxPlatCopyMemory(
+                    NewChunk->Buffer + LengthBeforeWrap,
+                    LastChunk->Buffer,
+                    WrittenSpan - LengthBeforeWrap);
+            }
         }
         RecvBuffer->ReadStart = 0;
         RecvBuffer->Capacity = NewChunk->AllocLength;
@@ -599,18 +640,39 @@ QuicRecvBufferCopyIntoChunks(
 
     const uint64_t RelativeOffset = WriteOffset - RecvBuffer->BaseOffset;
 
-    //
-    // Iterate over the list of chunk, copying the data.
-    //
-    QUIC_RECV_CHUNK_ITERATOR Iterator = QuicRecvBufferGetChunkIterator(RecvBuffer, RelativeOffset);
-    QUIC_BUFFER Buffer;
-    while (WriteLength != 0 && QuicRecvChunkIteratorNext(&Iterator, FALSE, &Buffer)) {
-        const uint32_t CopyLength = CXPLAT_MIN(Buffer.Length, WriteLength);
-        CxPlatCopyMemory(Buffer.Buffer, WriteBuffer, CopyLength);
-        WriteBuffer += CopyLength;
-        WriteLength -= (uint16_t)CopyLength;
+    if (RecvBuffer->RecvMode == QUIC_RECV_BUF_MODE_CIRCULAR) {
+        //
+        // CIRCULAR mode: two-segment memcpy through verified circular buffer.
+        // (Verified: Spec.write_preserves_coherence / Modular.circular_index_in_bounds)
+        //
+        uint32_t Al = RecvBuffer->VerifiedBuf.AllocLength;
+        uint32_t WriteStart =
+            (RecvBuffer->VerifiedBuf.ReadStart + (uint32_t)RelativeOffset) % Al;
+        uint32_t SpaceToEnd = Al - WriteStart;
+        if (WriteLength <= SpaceToEnd) {
+            CxPlatCopyMemory(
+                RecvBuffer->VerifiedBuf.Buffer + WriteStart, WriteBuffer, WriteLength);
+        } else {
+            CxPlatCopyMemory(
+                RecvBuffer->VerifiedBuf.Buffer + WriteStart, WriteBuffer, SpaceToEnd);
+            CxPlatCopyMemory(
+                RecvBuffer->VerifiedBuf.Buffer, WriteBuffer + SpaceToEnd,
+                WriteLength - SpaceToEnd);
+        }
+    } else {
+        //
+        // Iterate over the list of chunk, copying the data.
+        //
+        QUIC_RECV_CHUNK_ITERATOR Iterator = QuicRecvBufferGetChunkIterator(RecvBuffer, RelativeOffset);
+        QUIC_BUFFER Buffer;
+        while (WriteLength != 0 && QuicRecvChunkIteratorNext(&Iterator, FALSE, &Buffer)) {
+            const uint32_t CopyLength = CXPLAT_MIN(Buffer.Length, WriteLength);
+            CxPlatCopyMemory(Buffer.Buffer, WriteBuffer, CopyLength);
+            WriteBuffer += CopyLength;
+            WriteLength -= (uint16_t)CopyLength;
+        }
+        CXPLAT_DBG_ASSERT(WriteLength == 0); // Should always have enough room to copy everything
     }
-    CXPLAT_DBG_ASSERT(WriteLength == 0); // Should always have enough room to copy everything
 
     //
     // Update the amount of data readable in the first chunk.
@@ -620,6 +682,13 @@ QuicRecvBufferCopyIntoChunks(
         RecvBuffer->ReadLength = (uint32_t)CXPLAT_MIN(
             RecvBuffer->Capacity,
             FirstRange->Count - RecvBuffer->BaseOffset);
+    }
+
+    if (RecvBuffer->RecvMode == QUIC_RECV_BUF_MODE_CIRCULAR) {
+        //
+        // Sync verified buffer prefix length with ReadLength.
+        //
+        RecvBuffer->VerifiedBuf.PrefixLength = RecvBuffer->ReadLength;
     }
 }
 
@@ -955,6 +1024,16 @@ QuicRecvBufferDrainFirstChunk(
     CXPLAT_DBG_ASSERT(DrainLength < RecvBuffer->Capacity);
 
     RecvBuffer->ReadStart = (RecvBuffer->ReadStart + DrainLength) % FirstChunk->AllocLength;
+
+    if (RecvBuffer->RecvMode == QUIC_RECV_BUF_MODE_CIRCULAR) {
+        //
+        // Drain through verified buffer. VerifiedCircBufDrain computes:
+        //   ReadStart = (ReadStart + DrainLength) % AllocLength
+        //   PrefixLength -= DrainLength
+        // (Verified: Spec.drain_preserves_coherence / Modular.advance_read_start)
+        //
+        VerifiedCircBufDrain(&RecvBuffer->VerifiedBuf, (uint32_t)DrainLength);
+    }
 
     if (RecvBuffer->RecvMode == QUIC_RECV_BUF_MODE_APP_OWNED ||
         FirstChunk->Link.Flink != &RecvBuffer->Chunks) {
