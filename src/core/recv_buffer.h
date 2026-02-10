@@ -5,7 +5,9 @@
 
 --*/
 
+#ifdef QUIC_VERIFIED_CIRCULAR_BUFFER
 #include "circular_buffer_verified.h"
+#endif
 
 #if defined(__cplusplus)
 extern "C" {
@@ -102,11 +104,13 @@ typedef struct QUIC_RECV_BUFFER {
     //
     QUIC_RECV_BUF_MODE RecvMode;
 
+#ifdef QUIC_VERIFIED_CIRCULAR_BUFFER
     //
     // Formally verified circular buffer (used only in CIRCULAR mode).
     // Manages the physical buffer, ReadStart, PrefixLength internally.
     //
     VERIFIED_CIRC_BUFFER VerifiedBuf;
+#endif
 
 } QUIC_RECV_BUFFER;
 

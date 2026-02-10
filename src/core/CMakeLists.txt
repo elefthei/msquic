@@ -64,6 +64,10 @@ target_link_libraries(core PUBLIC inc)
 
 target_link_libraries(core PRIVATE warnings main_binary_link_args)
 
+if(QUIC_VERIFIED_CIRCULAR_BUFFER)
+    target_compile_definitions(core PUBLIC QUIC_VERIFIED_CIRCULAR_BUFFER)
+endif()
+
 set_property(TARGET core PROPERTY FOLDER "${QUIC_FOLDER_PREFIX}libraries")
 
 if (MSVC AND NOT QUIC_SANITIZER_ACTIVE)

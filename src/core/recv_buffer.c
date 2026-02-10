@@ -43,12 +43,14 @@ Abstract:
 #include "recv_buffer.c.clog.h"
 #endif
 
+#ifdef QUIC_VERIFIED_CIRCULAR_BUFFER
 //
 // Override verified buffer allocation to use msquic's allocator.
 //
 #define VERIFIED_CB_ALLOC(Size) CXPLAT_ALLOC_NONPAGED(Size, QUIC_POOL_RECVBUF)
 #define VERIFIED_CB_FREE(Ptr) CXPLAT_FREE(Ptr, QUIC_POOL_RECVBUF)
 #include "circular_buffer_verified.c"
+#endif
 
 typedef struct QUIC_RECV_CHUNK_ITERATOR {
     QUIC_RECV_CHUNK* NextChunk;
@@ -317,6 +319,7 @@ QuicRecvBufferInitialize(
         CxPlatListInsertHead(&RecvBuffer->Chunks, &Chunk->Link);
         RecvBuffer->Capacity = AllocBufferLength;
 
+#ifdef QUIC_VERIFIED_CIRCULAR_BUFFER
         if (RecvMode == QUIC_RECV_BUF_MODE_CIRCULAR) {
             //
             // Initialize the verified circular buffer.
@@ -333,6 +336,7 @@ QuicRecvBufferInitialize(
             RecvBuffer->VerifiedBuf.PrefixLength = 0;
             RecvBuffer->VerifiedBuf.VirtualLength = VirtualBufferLength;
         }
+#endif
     } else {
         RecvBuffer->Capacity = 0;
     }
@@ -542,6 +546,7 @@ QuicRecvBufferResize(
     //
 
     if (LastChunkIsFirst) {
+#ifdef QUIC_VERIFIED_CIRCULAR_BUFFER
         if (RecvBuffer->RecvMode == QUIC_RECV_BUF_MODE_CIRCULAR) {
             //
             // CIRCULAR mode: verified linearization + state update.
@@ -557,7 +562,9 @@ QuicRecvBufferResize(
                 &RecvBuffer->VerifiedBuf,
                 NewChunk->Buffer,
                 NewChunk->AllocLength);
-        } else {
+        } else
+#endif
+        {
             uint32_t WrittenSpan =
                 CXPLAT_MIN(LastChunk->AllocLength, QuicRecvBufferGetSpan(RecvBuffer));
             uint32_t LengthBeforeWrap = LastChunk->AllocLength - RecvBuffer->ReadStart;
@@ -640,6 +647,7 @@ QuicRecvBufferCopyIntoChunks(
 
     const uint64_t RelativeOffset = WriteOffset - RecvBuffer->BaseOffset;
 
+#ifdef QUIC_VERIFIED_CIRCULAR_BUFFER
     if (RecvBuffer->RecvMode == QUIC_RECV_BUF_MODE_CIRCULAR) {
         //
         // CIRCULAR mode: two-segment memcpy through verified circular buffer.
@@ -659,7 +667,9 @@ QuicRecvBufferCopyIntoChunks(
                 RecvBuffer->VerifiedBuf.Buffer, WriteBuffer + SpaceToEnd,
                 WriteLength - SpaceToEnd);
         }
-    } else {
+    } else
+#endif
+    {
         //
         // Iterate over the list of chunk, copying the data.
         //
@@ -684,12 +694,14 @@ QuicRecvBufferCopyIntoChunks(
             FirstRange->Count - RecvBuffer->BaseOffset);
     }
 
+#ifdef QUIC_VERIFIED_CIRCULAR_BUFFER
     if (RecvBuffer->RecvMode == QUIC_RECV_BUF_MODE_CIRCULAR) {
         //
         // Sync verified buffer prefix length with ReadLength.
         //
         RecvBuffer->VerifiedBuf.PrefixLength = RecvBuffer->ReadLength;
     }
+#endif
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -1025,6 +1037,7 @@ QuicRecvBufferDrainFirstChunk(
 
     RecvBuffer->ReadStart = (RecvBuffer->ReadStart + DrainLength) % FirstChunk->AllocLength;
 
+#ifdef QUIC_VERIFIED_CIRCULAR_BUFFER
     if (RecvBuffer->RecvMode == QUIC_RECV_BUF_MODE_CIRCULAR) {
         //
         // Drain through verified buffer. VerifiedCircBufDrain computes:
@@ -1034,6 +1047,7 @@ QuicRecvBufferDrainFirstChunk(
         //
         VerifiedCircBufDrain(&RecvBuffer->VerifiedBuf, (uint32_t)DrainLength);
     }
+#endif
 
     if (RecvBuffer->RecvMode == QUIC_RECV_BUF_MODE_APP_OWNED ||
         FirstChunk->Link.Flink != &RecvBuffer->Chunks) {
