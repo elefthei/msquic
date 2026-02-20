@@ -55,12 +55,30 @@ bench_recv_buffer: $(C_SOURCES) verified_support.h verified_recv_buffer.h
 	$(CC) $(CFLAGS) $(C_SOURCES) -o $@ $(LDFLAGS)
 
 # ─── Run benchmark ───────────────────────────────────────────────────
-bench: bench_recv_buffer
-	./bench_recv_buffer 200
+BENCH_ITERS ?= 200
+
+bench: bench.dat
+
+bench.dat: bench_recv_buffer
+	@rm -f bench.dat
+	@echo "=== Running verified benchmark ($(BENCH_ITERS) iterations) ==="
+	./bench_recv_buffer $(BENCH_ITERS) --gnuplot bench.dat --label verified
+	@if [ -x ./bench_recv_buffer_orig ]; then \
+		echo ""; \
+		echo "=== Running unverified benchmark ($(BENCH_ITERS) iterations) ==="; \
+		./bench_recv_buffer_orig $(BENCH_ITERS) --gnuplot bench.dat --label unverified; \
+	else \
+		echo ""; \
+		echo "WARNING: bench_recv_buffer_orig not found, running verified again as placeholder"; \
+		./bench_recv_buffer $(BENCH_ITERS) --gnuplot bench.dat --label unverified; \
+	fi
 
 # ─── Generate gnuplot charts ─────────────────────────────────────────
-plot: bench_recv_buffer
-	./plot.sh
+plot: bench.dat
+	./plot.sh --png
+
+plot-pdf: bench.dat
+	./plot.sh --pdf
 
 # ─── Full extraction pipeline: Pulse → krml → C → copy to source ────
 extract: extract-krml extract-c install-extracted
@@ -102,12 +120,15 @@ install-extracted: extract-c
 
 # ─── Clean ────────────────────────────────────────────────────────────
 clean:
-	rm -f bench_recv_buffer bench.dat sequential.png ooo.png
+	rm -f bench_recv_buffer bench.dat \
+	     seq_write.png seq_read.png ooo_write.png ooo_read.png \
+	     seq_write.tex seq_write.pdf seq_read.tex seq_read.pdf \
+	     ooo_write.tex ooo_write.pdf ooo_read.tex ooo_read.pdf
 
 clean-extract:
 	rm -rf $(KRML_OUTPUT) $(KRML_COUTPUT)
 
 distclean: clean clean-extract
 
-.PHONY: all bench plot extract extract-krml extract-c install-extracted \
+.PHONY: all bench plot plot-pdf extract extract-krml extract-c install-extracted \
         clean clean-extract distclean
