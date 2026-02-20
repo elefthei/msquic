@@ -2,17 +2,11 @@
  * bench_recv_buffer.c
  *
  * Benchmark for the verified CircularBuffer (Karamel-extracted from Pulse).
- * Tests various out-of-order write and read patterns, reporting throughput
- * and latency metrics.
+ * Two scenarios — sequential and out-of-order — across chunk sizes 2–64 B.
+ * Reports write and read throughput (MB/s).
  *
- * Compile:
- *   gcc -O2 -I ~/karamel/include -I ~/karamel/krmllib/dist/minimal -I . -I .. \
- *       -include verified_support.h \
- *       bench_recv_buffer.c verified_recv_buffer.c krmlinit.c krmlinit_rv.c \
- *       verified_prims_support.c -o bench_recv_buffer -w
- *
- * Run:
- *   ./bench_recv_buffer [iterations]
+ * Build:  make
+ * Run:    ./bench_recv_buffer [iterations]
  */
 
 #include <stdio.h>
@@ -21,12 +15,9 @@
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
-#include <assert.h>
 
-/* Include the wrapper which pulls in verified_recv_buffer.h */
 #include "../verified_wrapper_recv_buffer.h"
 
-/* From krmlinit */
 extern void krmlinit_globals(void);
 
 /* ─── Timing helpers ──────────────────────────────────────────────── */
@@ -40,22 +31,9 @@ now_ns(void)
 }
 
 static inline double
-elapsed_ms(uint64_t start, uint64_t end)
+throughput_mbps(uint64_t total_bytes, uint64_t elapsed_ns)
 {
-    return (double)(end - start) / 1e6;
-}
-
-static inline double
-ops_per_sec(uint64_t n_ops, uint64_t start, uint64_t end)
-{
-    double secs = (double)(end - start) / 1e9;
-    return secs > 0 ? (double)n_ops / secs : 0;
-}
-
-static inline double
-throughput_mbps(uint64_t total_bytes, uint64_t start, uint64_t end)
-{
-    double secs = (double)(end - start) / 1e9;
+    double secs = (double)elapsed_ns / 1e9;
     return secs > 0 ? ((double)total_bytes / (1024.0 * 1024.0)) / secs : 0;
 }
 
@@ -74,7 +52,6 @@ xorshift64(void)
     return x;
 }
 
-/* Fisher-Yates shuffle */
 static void
 shuffle(uint32_t* arr, uint32_t n)
 {
@@ -86,469 +63,214 @@ shuffle(uint32_t* arr, uint32_t n)
     }
 }
 
-/* ─── Fill buffer with deterministic pattern ──────────────────────── */
-
 static void
 fill_pattern(uint8_t* buf, uint32_t len, uint64_t offset)
 {
-    for (uint32_t i = 0; i < len; i++) {
+    for (uint32_t i = 0; i < len; i++)
         buf[i] = (uint8_t)((offset + i) & 0xFF);
-    }
 }
 
-/* ─── Benchmark results ───────────────────────────────────────────── */
+/* ─── Result for one (scenario, chunk_size) point ─────────────────── */
 
 typedef struct {
-    const char* name;
-    double time_ms;
-    double write_ops_sec;
-    double read_ops_sec;
-    double write_mbps;
-    double read_mbps;
-    uint64_t total_written;
-    uint64_t total_read;
-    uint32_t n_writes;
-    uint32_t n_reads;
-} bench_result_t;
+    uint32_t chunk_size;
+    double   write_mbps;
+    double   read_mbps;
+} point_t;
 
-static void
-print_result(const bench_result_t* r)
+/* ─── Sequential writes + reads ───────────────────────────────────── */
+
+static point_t
+bench_sequential(uint32_t iterations, uint32_t chunk_size)
 {
-    printf("  %-35s %8.2f ms\n", r->name, r->time_ms);
-    if (r->n_writes > 0) {
-        printf("    Writes: %6u ops, %10.0f ops/s, %8.2f MB/s (%lu bytes)\n",
-               r->n_writes, r->write_ops_sec, r->write_mbps,
-               (unsigned long)r->total_written);
-    }
-    if (r->n_reads > 0) {
-        printf("    Reads:  %6u ops, %10.0f ops/s, %8.2f MB/s (%lu bytes)\n",
-               r->n_reads, r->read_ops_sec, r->read_mbps,
-               (unsigned long)r->total_read);
-    }
-    printf("\n");
-}
-
-/* ─── Scenario 1: Sequential writes ──────────────────────────────── */
-
-static bench_result_t
-bench_sequential_writes(uint32_t iterations, uint32_t chunk_size)
-{
-    bench_result_t result = { .name = "Sequential writes" };
+    point_t r = { .chunk_size = chunk_size };
     uint8_t* data = malloc(chunk_size);
-    fill_pattern(data, chunk_size, 0);
-
     uint32_t alloc_len = 65536;
-    uint32_t virt_len = alloc_len;
-
-    uint64_t t_start = now_ns();
-    uint64_t write_start, write_end, read_start, read_end;
+    uint32_t n_chunks = alloc_len / chunk_size;
+    uint64_t total_bytes = (uint64_t)n_chunks * chunk_size * iterations;
+    uint64_t write_ns = 0, read_ns = 0;
 
     for (uint32_t iter = 0; iter < iterations; iter++) {
         VERIFIED_RECV_BUFFER buf = {0};
-        VerifiedRecvBufferInitialize(&buf, alloc_len, virt_len);
+        VerifiedRecvBufferInitialize(&buf, alloc_len, alloc_len);
+        BOOLEAN ndr;
 
-        uint32_t n_chunks = alloc_len / chunk_size;
-        BOOLEAN newDataReady;
-
-        /* Write phase */
-        write_start = now_ns();
+        uint64_t t0 = now_ns();
         for (uint32_t i = 0; i < n_chunks; i++) {
             fill_pattern(data, chunk_size, (uint64_t)i * chunk_size);
             VerifiedRecvBufferWrite(&buf, (uint64_t)i * chunk_size,
-                                    (uint16_t)chunk_size, data, &newDataReady);
+                                    (uint16_t)chunk_size, data, &ndr);
         }
-        write_end = now_ns();
+        uint64_t t1 = now_ns();
 
-        /* Read phase */
-        read_start = now_ns();
         uint64_t offset;
         uint32_t count = 2;
         QUIC_BUFFER buffers[2] = {0};
         VerifiedRecvBufferRead(&buf, &offset, &count, buffers);
-        read_end = now_ns();
-
-        /* Drain */
         uint64_t total = 0;
         for (uint32_t i = 0; i < count; i++) total += buffers[i].Length;
         VerifiedRecvBufferDrain(&buf, total);
+        uint64_t t2 = now_ns();
 
-        result.n_writes += n_chunks;
-        result.n_reads += 1;
-        result.total_written += (uint64_t)n_chunks * chunk_size;
-        result.total_read += total;
+        write_ns += (t1 - t0);
+        read_ns  += (t2 - t1);
 
         VerifiedRecvBufferUninitialize(&buf);
     }
 
-    uint64_t t_end = now_ns();
-    result.time_ms = elapsed_ms(t_start, t_end);
-    result.write_ops_sec = ops_per_sec(result.n_writes, t_start, t_end);
-    result.read_ops_sec = ops_per_sec(result.n_reads, t_start, t_end);
-    result.write_mbps = throughput_mbps(result.total_written, t_start, t_end);
-    result.read_mbps = throughput_mbps(result.total_read, t_start, t_end);
-
+    r.write_mbps = throughput_mbps(total_bytes, write_ns);
+    r.read_mbps  = throughput_mbps(total_bytes, read_ns);
     free(data);
-    return result;
+    return r;
 }
 
-/* ─── Scenario 2: Out-of-order writes ────────────────────────────── */
+/* ─── Out-of-order writes + reads ─────────────────────────────────── */
 
-static bench_result_t
-bench_ooo_writes(uint32_t iterations, uint32_t chunk_size)
+static point_t
+bench_ooo(uint32_t iterations, uint32_t chunk_size)
 {
-    bench_result_t result = { .name = "Out-of-order writes" };
+    point_t r = { .chunk_size = chunk_size };
     uint8_t* data = malloc(chunk_size);
-
     uint32_t alloc_len = 65536;
-    uint32_t virt_len = alloc_len;
     uint32_t n_chunks = alloc_len / chunk_size;
+    uint64_t total_bytes = (uint64_t)n_chunks * chunk_size * iterations;
+    uint64_t write_ns = 0, read_ns = 0;
 
-    /* Create shuffled index array */
     uint32_t* order = malloc(n_chunks * sizeof(uint32_t));
     for (uint32_t i = 0; i < n_chunks; i++) order[i] = i;
 
-    uint64_t t_start = now_ns();
-
     for (uint32_t iter = 0; iter < iterations; iter++) {
         VERIFIED_RECV_BUFFER buf = {0};
-        VerifiedRecvBufferInitialize(&buf, alloc_len, virt_len);
-
-        /* Shuffle write order each iteration */
+        VerifiedRecvBufferInitialize(&buf, alloc_len, alloc_len);
         shuffle(order, n_chunks);
+        BOOLEAN ndr;
 
-        BOOLEAN newDataReady;
-
-        /* Write phase: out-of-order */
+        uint64_t t0 = now_ns();
         for (uint32_t i = 0; i < n_chunks; i++) {
             uint64_t off = (uint64_t)order[i] * chunk_size;
             fill_pattern(data, chunk_size, off);
             VerifiedRecvBufferWrite(&buf, off, (uint16_t)chunk_size,
-                                    data, &newDataReady);
+                                    data, &ndr);
         }
+        uint64_t t1 = now_ns();
 
-        /* Read phase */
         uint64_t offset;
         uint32_t count = 2;
         QUIC_BUFFER buffers[2] = {0};
         VerifiedRecvBufferRead(&buf, &offset, &count, buffers);
-
         uint64_t total = 0;
         for (uint32_t i = 0; i < count; i++) total += buffers[i].Length;
         VerifiedRecvBufferDrain(&buf, total);
+        uint64_t t2 = now_ns();
 
-        result.n_writes += n_chunks;
-        result.n_reads += 1;
-        result.total_written += (uint64_t)n_chunks * chunk_size;
-        result.total_read += total;
+        write_ns += (t1 - t0);
+        read_ns  += (t2 - t1);
 
         VerifiedRecvBufferUninitialize(&buf);
     }
 
-    uint64_t t_end = now_ns();
-    result.time_ms = elapsed_ms(t_start, t_end);
-    result.write_ops_sec = ops_per_sec(result.n_writes, t_start, t_end);
-    result.read_ops_sec = ops_per_sec(result.n_reads, t_start, t_end);
-    result.write_mbps = throughput_mbps(result.total_written, t_start, t_end);
-    result.read_mbps = throughput_mbps(result.total_read, t_start, t_end);
-
+    r.write_mbps = throughput_mbps(total_bytes, write_ns);
+    r.read_mbps  = throughput_mbps(total_bytes, read_ns);
     free(order);
     free(data);
-    return result;
-}
-
-/* ─── Scenario 3: Interleaved write/read/drain ───────────────────── */
-
-static bench_result_t
-bench_interleaved(uint32_t iterations, uint32_t chunk_size)
-{
-    bench_result_t result = { .name = "Interleaved write/read/drain" };
-    uint8_t* data = malloc(chunk_size);
-
-    uint32_t alloc_len = 65536;
-    uint32_t virt_len = 1 << 20; /* 1MB virtual to allow many cycles */
-    uint32_t batch_size = 8;     /* write 8 chunks, then read+drain */
-
-    uint64_t t_start = now_ns();
-
-    for (uint32_t iter = 0; iter < iterations; iter++) {
-        VERIFIED_RECV_BUFFER buf = {0};
-        VerifiedRecvBufferInitialize(&buf, alloc_len, virt_len);
-
-        uint64_t write_offset = 0;
-        uint32_t cycles = 32; /* 32 write-read-drain cycles per iteration */
-
-        for (uint32_t c = 0; c < cycles; c++) {
-            BOOLEAN newDataReady;
-
-            /* Write a batch sequentially */
-            for (uint32_t i = 0; i < batch_size; i++) {
-                fill_pattern(data, chunk_size, write_offset);
-                VerifiedRecvBufferWrite(&buf, write_offset,
-                                        (uint16_t)chunk_size, data,
-                                        &newDataReady);
-                write_offset += chunk_size;
-                result.n_writes++;
-                result.total_written += chunk_size;
-            }
-
-            /* Read */
-            uint64_t offset;
-            uint32_t count = 2;
-            QUIC_BUFFER buffers[2] = {0};
-            VerifiedRecvBufferRead(&buf, &offset, &count, buffers);
-
-            uint64_t total = 0;
-            for (uint32_t i = 0; i < count; i++) total += buffers[i].Length;
-            result.n_reads++;
-            result.total_read += total;
-
-            /* Drain everything */
-            VerifiedRecvBufferDrain(&buf, total);
-        }
-
-        VerifiedRecvBufferUninitialize(&buf);
-    }
-
-    uint64_t t_end = now_ns();
-    result.time_ms = elapsed_ms(t_start, t_end);
-    result.write_ops_sec = ops_per_sec(result.n_writes, t_start, t_end);
-    result.read_ops_sec = ops_per_sec(result.n_reads, t_start, t_end);
-    result.write_mbps = throughput_mbps(result.total_written, t_start, t_end);
-    result.read_mbps = throughput_mbps(result.total_read, t_start, t_end);
-
-    free(data);
-    return result;
-}
-
-/* ─── Scenario 4: Small OOO writes (stress gap tracking) ─────────── */
-
-static bench_result_t
-bench_small_ooo(uint32_t iterations)
-{
-    bench_result_t result = { .name = "Small OOO writes (16B, gap stress)" };
-    uint32_t chunk_size = 16;
-    uint8_t data[16];
-
-    uint32_t alloc_len = 4096;
-    uint32_t virt_len = alloc_len;
-    uint32_t n_chunks = alloc_len / chunk_size; /* 256 chunks */
-
-    uint32_t* order = malloc(n_chunks * sizeof(uint32_t));
-    for (uint32_t i = 0; i < n_chunks; i++) order[i] = i;
-
-    uint64_t t_start = now_ns();
-
-    for (uint32_t iter = 0; iter < iterations; iter++) {
-        VERIFIED_RECV_BUFFER buf = {0};
-        VerifiedRecvBufferInitialize(&buf, alloc_len, virt_len);
-
-        /* Write every other chunk first (max gaps), then fill */
-        for (uint32_t i = 0; i < n_chunks; i += 2) {
-            uint64_t off = (uint64_t)i * chunk_size;
-            fill_pattern(data, chunk_size, off);
-            BOOLEAN ndr;
-            VerifiedRecvBufferWrite(&buf, off, chunk_size, data, &ndr);
-            result.n_writes++;
-            result.total_written += chunk_size;
-        }
-
-        /* Fill remaining gaps */
-        for (uint32_t i = 1; i < n_chunks; i += 2) {
-            uint64_t off = (uint64_t)i * chunk_size;
-            fill_pattern(data, chunk_size, off);
-            BOOLEAN ndr;
-            VerifiedRecvBufferWrite(&buf, off, chunk_size, data, &ndr);
-            result.n_writes++;
-            result.total_written += chunk_size;
-        }
-
-        /* Read + drain */
-        uint64_t offset;
-        uint32_t count = 2;
-        QUIC_BUFFER buffers[2] = {0};
-        VerifiedRecvBufferRead(&buf, &offset, &count, buffers);
-        uint64_t total = 0;
-        for (uint32_t i = 0; i < count; i++) total += buffers[i].Length;
-        result.n_reads++;
-        result.total_read += total;
-        VerifiedRecvBufferDrain(&buf, total);
-
-        VerifiedRecvBufferUninitialize(&buf);
-    }
-
-    uint64_t t_end = now_ns();
-    result.time_ms = elapsed_ms(t_start, t_end);
-    result.write_ops_sec = ops_per_sec(result.n_writes, t_start, t_end);
-    result.read_ops_sec = ops_per_sec(result.n_reads, t_start, t_end);
-    result.write_mbps = throughput_mbps(result.total_written, t_start, t_end);
-    result.read_mbps = throughput_mbps(result.total_read, t_start, t_end);
-
-    free(order);
-    return result;
-}
-
-/* ─── Scenario 5: Large sequential writes (throughput) ───────────── */
-
-static bench_result_t
-bench_large_sequential(uint32_t iterations)
-{
-    bench_result_t result = { .name = "Large sequential writes (4KB)" };
-    uint32_t chunk_size = 4096;
-    uint8_t* data = malloc(chunk_size);
-
-    uint32_t alloc_len = 65536;
-    uint32_t virt_len = alloc_len;
-    uint32_t n_chunks = alloc_len / chunk_size; /* 16 chunks */
-
-    uint64_t t_start = now_ns();
-
-    for (uint32_t iter = 0; iter < iterations; iter++) {
-        VERIFIED_RECV_BUFFER buf = {0};
-        VerifiedRecvBufferInitialize(&buf, alloc_len, virt_len);
-
-        BOOLEAN newDataReady;
-        for (uint32_t i = 0; i < n_chunks; i++) {
-            fill_pattern(data, chunk_size, (uint64_t)i * chunk_size);
-            VerifiedRecvBufferWrite(&buf, (uint64_t)i * chunk_size,
-                                    (uint16_t)chunk_size, data,
-                                    &newDataReady);
-            result.n_writes++;
-            result.total_written += chunk_size;
-        }
-
-        uint64_t offset;
-        uint32_t count = 2;
-        QUIC_BUFFER buffers[2] = {0};
-        VerifiedRecvBufferRead(&buf, &offset, &count, buffers);
-        uint64_t total = 0;
-        for (uint32_t i = 0; i < count; i++) total += buffers[i].Length;
-        result.n_reads++;
-        result.total_read += total;
-        VerifiedRecvBufferDrain(&buf, total);
-
-        VerifiedRecvBufferUninitialize(&buf);
-    }
-
-    uint64_t t_end = now_ns();
-    result.time_ms = elapsed_ms(t_start, t_end);
-    result.write_ops_sec = ops_per_sec(result.n_writes, t_start, t_end);
-    result.read_ops_sec = ops_per_sec(result.n_reads, t_start, t_end);
-    result.write_mbps = throughput_mbps(result.total_written, t_start, t_end);
-    result.read_mbps = throughput_mbps(result.total_read, t_start, t_end);
-
-    free(data);
-    return result;
+    return r;
 }
 
 /* ─── Main ────────────────────────────────────────────────────────── */
 
+static const uint32_t SIZES[] = { 2, 4, 8, 16, 32, 64 };
+#define N_SIZES (sizeof(SIZES) / sizeof(SIZES[0]))
+
 int main(int argc, char* argv[])
 {
-    uint32_t iterations = 100;
-    if (argc > 1) {
-        iterations = (uint32_t)atoi(argv[1]);
-        if (iterations == 0) iterations = 100;
-    }
-
-    /* Initialize Karamel globals (cb_max_length_sz) */
-    krmlinit_globals();
-
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("  Verified CircularBuffer Benchmark\n");
-    printf("  Iterations per scenario: %u\n", iterations);
-    printf("═══════════════════════════════════════════════════════════════\n\n");
-
-    bench_result_t results[5];
-
-    printf("Running: Sequential writes (256B chunks)...\n");
-    results[0] = bench_sequential_writes(iterations, 256);
-    print_result(&results[0]);
-
-    printf("Running: Out-of-order writes (256B chunks)...\n");
-    results[1] = bench_ooo_writes(iterations, 256);
-    print_result(&results[1]);
-
-    printf("Running: Interleaved write/read/drain (256B chunks)...\n");
-    results[2] = bench_interleaved(iterations, 256);
-    print_result(&results[2]);
-
-    printf("Running: Small OOO writes (16B, gap stress)...\n");
-    results[3] = bench_small_ooo(iterations);
-    print_result(&results[3]);
-
-    printf("Running: Large sequential writes (4KB)...\n");
-    results[4] = bench_large_sequential(iterations);
-    print_result(&results[4]);
-
-    /* Summary table */
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("  Summary\n");
-    printf("───────────────────────────────────────────────────────────────\n");
-    printf("  %-35s %10s %10s\n", "Scenario", "Write MB/s", "Write ops/s");
-    printf("───────────────────────────────────────────────────────────────\n");
-    for (int i = 0; i < 5; i++) {
-        printf("  %-35s %10.2f %10.0f\n",
-               results[i].name, results[i].write_mbps, results[i].write_ops_sec);
-    }
-    printf("═══════════════════════════════════════════════════════════════\n");
-
-    /* Write gnuplot-compatible data file if --gnuplot <file> is given */
+    uint32_t iterations = 200;
     const char* gnuplot_file = NULL;
     const char* label = "verified";
-    for (int i = 1; i < argc - 1; i++) {
-        if (strcmp(argv[i], "--gnuplot") == 0)
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--gnuplot") == 0 && i + 1 < argc)
             gnuplot_file = argv[++i];
-        else if (strcmp(argv[i], "--label") == 0)
+        else if (strcmp(argv[i], "--label") == 0 && i + 1 < argc)
             label = argv[++i];
+        else {
+            uint32_t v = (uint32_t)atoi(argv[i]);
+            if (v > 0) iterations = v;
+        }
     }
+
+    krmlinit_globals();
+
+    point_t seq[N_SIZES], ooo[N_SIZES];
+
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("  CircularBuffer Benchmark  (%s, %u iterations)\n",
+           label, iterations);
+    printf("═══════════════════════════════════════════════════════════════\n\n");
+
+    /* Sequential */
+    printf("  Sequential writes + reads\n");
+    printf("  %-10s %12s %12s\n", "ChunkSize", "Write MB/s", "Read MB/s");
+    printf("  ──────────────────────────────────────\n");
+    for (uint32_t s = 0; s < N_SIZES; s++) {
+        seq[s] = bench_sequential(iterations, SIZES[s]);
+        printf("  %-10u %12.2f %12.2f\n",
+               seq[s].chunk_size, seq[s].write_mbps, seq[s].read_mbps);
+    }
+
+    printf("\n");
+
+    /* Out-of-order */
+    printf("  Out-of-order writes + reads\n");
+    printf("  %-10s %12s %12s\n", "ChunkSize", "Write MB/s", "Read MB/s");
+    printf("  ──────────────────────────────────────\n");
+    for (uint32_t s = 0; s < N_SIZES; s++) {
+        ooo[s] = bench_ooo(iterations, SIZES[s]);
+        printf("  %-10u %12.2f %12.2f\n",
+               ooo[s].chunk_size, ooo[s].write_mbps, ooo[s].read_mbps);
+    }
+
+    printf("\n═══════════════════════════════════════════════════════════════\n");
+
+    /* ─── Gnuplot output ──────────────────────────────────────────── */
     if (gnuplot_file) {
         /*
-         * Output format: tab-separated, one row per scenario.
-         * Columns: Scenario  WriteMBps  WriteOps  ReadMBps  ReadOps  TimeMs
+         * Data blocks (separated by double blank lines for gnuplot "index"):
+         *   index 0: sequential   (columns: chunk_size  write_mbps  read_mbps)
+         *   index 1: out-of-order
          *
-         * To plot verified vs unverified, run each benchmark with a
-         * different --label and append to the same file:
-         *
-         *   ./bench_recv_buffer 100 --gnuplot bench.dat --label verified
-         *   ./bench_recv_buffer_orig 100 --gnuplot bench.dat --label unverified
-         *
-         * Then use gnuplot:
-         *
-         *   set terminal pngcairo size 900,500
-         *   set output 'throughput.png'
-         *   set style data linespoints
-         *   set ylabel 'Write MB/s'
-         *   set xtics rotate by -30
-         *   plot 'bench.dat' index 0 using 2:xtic(1) title 'verified', \
-         *        'bench.dat' index 1 using 2:xtic(1) title 'unverified'
+         * Run twice (verified, unverified) → 4 blocks total:
+         *   index 0: verified sequential
+         *   index 1: verified ooo
+         *   index 2: unverified sequential
+         *   index 3: unverified ooo
          */
         int append = 0;
-        /* Append if file already exists and is non-empty */
         FILE* check = fopen(gnuplot_file, "r");
         if (check) { append = (fgetc(check) != EOF); fclose(check); }
 
         FILE* fp = fopen(gnuplot_file, append ? "a" : "w");
         if (fp) {
             if (!append) {
-                fprintf(fp, "# Benchmark data for gnuplot\n");
-                fprintf(fp, "# Columns: Scenario  WriteMBps  WriteOps  ReadMBps  ReadOps  TimeMs\n");
-                fprintf(fp, "# Use 'index N' in gnuplot to select dataset N\n\n");
+                fprintf(fp, "# Columns: ChunkSize  WriteMBps  ReadMBps\n");
+                fprintf(fp, "# index 0,2: sequential   index 1,3: ooo\n\n");
             } else {
-                /* Blank lines separate gnuplot data blocks (index N) */
                 fprintf(fp, "\n\n");
             }
-            fprintf(fp, "# %s\n", label);
-            for (int i = 0; i < 5; i++) {
-                fprintf(fp, "\"%s\"\t%.2f\t%.0f\t%.2f\t%.0f\t%.2f\n",
-                        results[i].name,
-                        results[i].write_mbps, results[i].write_ops_sec,
-                        results[i].read_mbps, results[i].read_ops_sec,
-                        results[i].time_ms);
-            }
+
+            /* Sequential block */
+            fprintf(fp, "# %s sequential\n", label);
+            for (uint32_t s = 0; s < N_SIZES; s++)
+                fprintf(fp, "%u\t%.2f\t%.2f\n",
+                        seq[s].chunk_size, seq[s].write_mbps, seq[s].read_mbps);
+
+            /* OOO block */
+            fprintf(fp, "\n\n# %s ooo\n", label);
+            for (uint32_t s = 0; s < N_SIZES; s++)
+                fprintf(fp, "%u\t%.2f\t%.2f\n",
+                        ooo[s].chunk_size, ooo[s].write_mbps, ooo[s].read_mbps);
+
             fclose(fp);
-            printf("\nGnuplot data written to %s (label: %s)\n", gnuplot_file, label);
-        } else {
-            fprintf(stderr, "Error: could not open %s for writing\n", gnuplot_file);
+            printf("Gnuplot data → %s (%s)\n", gnuplot_file, label);
         }
     }
 

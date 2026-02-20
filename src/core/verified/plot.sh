@@ -4,6 +4,10 @@
 # Usage:
 #   ./plot.sh [iterations]          # default: 200
 #   ./plot.sh 500                   # more iterations for stable results
+#
+# Generates two figures:
+#   sequential.png — Sequential write/read throughput vs chunk size
+#   ooo.png        — Out-of-order write/read throughput vs chunk size
 
 set -e
 cd "$(dirname "$0")"
@@ -29,31 +33,37 @@ fi
 echo ""
 echo "=== Generating plots ==="
 
+# Data layout in bench.dat:
+#   index 0: verified sequential   (cols: chunk_size  write_mbps  read_mbps)
+#   index 1: verified ooo
+#   index 2: unverified sequential
+#   index 3: unverified ooo
+
 gnuplot <<'GNUPLOT'
 set terminal pngcairo size 900,500 enhanced font 'Arial,11'
 set style data linespoints
-set xtics rotate by -25
 set grid ytics
-set key top right
+set key top left
 set yrange [0:*]
+set xlabel 'Chunk Size (bytes)'
+set logscale x 2
+set xrange [1:128]
 
-set output 'throughput.png'
-set title 'Write Throughput — Verified vs Unverified CircularBuffer'
-set ylabel 'Write Throughput (MB/s)'
-plot 'bench.dat' index 0 using 2:xtic(1) title 'verified' lw 2 pt 7 ps 1.2, \
-     'bench.dat' index 1 using 2:xtic(1) title 'unverified' lw 2 pt 5 ps 1.2
+set output 'sequential.png'
+set title 'Sequential Throughput — Verified vs Unverified'
+set ylabel 'Throughput (MB/s)'
+plot 'bench.dat' index 0 using 1:2 title 'verified write'   lw 2 pt 7 ps 1.2, \
+     'bench.dat' index 0 using 1:3 title 'verified read'    lw 2 pt 9 ps 1.2, \
+     'bench.dat' index 2 using 1:2 title 'unverified write' lw 2 pt 5 ps 1.2 dt 2, \
+     'bench.dat' index 2 using 1:3 title 'unverified read'  lw 2 pt 11 ps 1.2 dt 2
 
-set output 'ops.png'
-set title 'Write Ops/s — Verified vs Unverified CircularBuffer'
-set ylabel 'Write ops/s'
-plot 'bench.dat' index 0 using 3:xtic(1) title 'verified' lw 2 pt 7 ps 1.2, \
-     'bench.dat' index 1 using 3:xtic(1) title 'unverified' lw 2 pt 5 ps 1.2
-
-set output 'latency.png'
-set title 'Total Time — Verified vs Unverified CircularBuffer'
-set ylabel 'Time (ms)'
-plot 'bench.dat' index 0 using 6:xtic(1) title 'verified' lw 2 pt 7 ps 1.2, \
-     'bench.dat' index 1 using 6:xtic(1) title 'unverified' lw 2 pt 5 ps 1.2
+set output 'ooo.png'
+set title 'Out-of-Order Throughput — Verified vs Unverified'
+set ylabel 'Throughput (MB/s)'
+plot 'bench.dat' index 1 using 1:2 title 'verified write'   lw 2 pt 7 ps 1.2, \
+     'bench.dat' index 1 using 1:3 title 'verified read'    lw 2 pt 9 ps 1.2, \
+     'bench.dat' index 3 using 1:2 title 'unverified write' lw 2 pt 5 ps 1.2 dt 2, \
+     'bench.dat' index 3 using 1:3 title 'unverified read'  lw 2 pt 11 ps 1.2 dt 2
 GNUPLOT
 
-echo "Generated: throughput.png  ops.png  latency.png"
+echo "Generated: sequential.png  ooo.png"

@@ -7,6 +7,9 @@
 /* ---- Vector operations for Pulse_Lib_RangeVec_range ---- */
 /* Ghost parameters (erased #s, #cap) are passed as void* null pointers */
 
+typedef Pulse_Lib_RangeVec_range range_t;
+typedef Pulse_Lib_Vector_vector_internal__Pulse_Lib_RangeVec_range vec_t;
+
 vec_t *Pulse_Lib_Vector_create(range_t def, size_t n) {
     vec_t *v = (vec_t *)malloc(sizeof(vec_t));
     v->arr = (range_t *)malloc(n * sizeof(range_t));
